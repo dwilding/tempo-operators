@@ -135,6 +135,15 @@ wheels = [
 ]
 
 [[package]]
+name = "charmlibs-interfaces-tracing"
+version = "1.0.0"
+source = { git = "https://github.com/dwilding/charmlibs?subdirectory=interfaces%2Ftracing&rev=add-tracing-lib#9f7f2229f577421908200bfdbc2df98de1e1e904" }
+dependencies = [
+    { name = "ops" },
+    { name = "pydantic" },
+]
+
+[[package]]
 name = "charmlibs-nginx-k8s"
 version = "1.0.1"
 source = { registry = "https://pypi.org/simple" }
@@ -935,6 +944,7 @@ version = "0.1"
 source = { virtual = "." }
 dependencies = [
     { name = "charmed-service-mesh-helpers" },
+    { name = "charmlibs-interfaces-tracing" },
     { name = "coordinated-workers" },
     { name = "cryptography" },
     { name = "lightkube-extensions" },
@@ -963,6 +973,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "charmed-service-mesh-helpers", specifier = ">=0.2.0" },
+    { name = "charmlibs-interfaces-tracing", git = "https://github.com/dwilding/charmlibs?subdirectory=interfaces%2Ftracing&rev=add-tracing-lib" },
     { name = "coordinated-workers", specifier = ">=4.1.2" },
     { name = "coverage", extras = ["toml"], marker = "extra == 'dev'" },
     { name = "cryptography" },
