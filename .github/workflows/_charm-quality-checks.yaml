@@ -1,0 +1,440 @@
+name: Quality Checks
+
+on:
+  workflow_call:
+    inputs:
+      charm-path:
+        type: string
+        required: false
+        default: .
+      provider:
+        type: string
+        description: "The provider to choose for integration tests ('machine', 'microk8s', or 'k8s')"
+        required: true
+      charmcraft-channel:
+        type: string
+        required: true
+        description: |
+          The snap channel from which to install Charmcraft.
+      juju-channel:
+        type: string
+        required: true
+        description: |
+          The snap channel from which to install Juju.
+          Overrides the default branch-dependant selection of the Juju version.
+      parallelize-integration:
+        description: |
+          Parallelize integration tests by spinning up one runner per Python file.
+        required: true
+        type: boolean
+      automatically-retry-hooks:
+        description: |
+          Whether Juju models should automatically-retry hooks.
+          Sets the `automatically-retry-hooks` in the model-defaults config.
+        required: true
+        type: boolean
+      enable-integration:
+        description: |
+          Enable running integration tests.
+        type: boolean
+        default: true
+        required: false
+    secrets:
+      CHARMHUB_TOKEN:
+        required: false
+jobs:
+  snap-channels:
+    name: Select snap channels
+    runs-on: ubuntu-latest
+    outputs:
+      juju-channel: ${{ steps.channels.outputs.juju-channel }}
+    env:
+      BRANCH_NAME: ${{ github.base_ref || github.ref_name }}
+    steps:
+      - name: Determine Juju version
+        id: channels
+        run: |
+          # If a Juju version is passed from the inputs use that, otherwise use the defaults
+          # we picked for each track name
+          if [[ -n "${{ inputs.juju-channel }}" ]]; then
+            echo "juju-channel=${{ inputs.juju-channel }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${BRANCH_NAME#refs/heads/}" == "track/1" ]]; then
+            echo "juju-channel=3.1/stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "juju-channel=3.6/stable" >> "$GITHUB_OUTPUT"
+          fi
+
+  call-inclusive-naming-check:
+    # Issues with this workflow can be addressed by adding a .wokeignore in the repository root
+    name: Inclusive naming
+    uses: canonical/Inclusive-naming/.github/workflows/woke.yaml@main
+    with:
+      fail-on-error: "false"
+
+  codeql:
+    name: CodeQL analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  linting:
+    name: Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Lint
+        run: |
+          sudo snap install astral-uv --classic
+          cd "${{ inputs.charm-path }}"
+          uvx tox -e lint
+
+  linting-rules:
+    name: Lint alert rules
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Download promtool and lint rules
+        env:
+          CHARM_PATH: "${{ inputs.charm-path }}"
+          PROMTOOL_VERSION: 2.55.0
+        run: |
+          # Get promtool
+          releases_url="https://github.com/prometheus/prometheus/releases/download"
+          promtool_url="${releases_url}/v${PROMTOOL_VERSION}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz"
+          curl -sSL -o promtool.tar.gz "$promtool_url"
+          tar -xzf promtool.tar.gz --strip-components=1
+          # Lint the alert rules
+          if [[ -d "$CHARM_PATH"/src/prometheus_alert_rules ]]; then
+            find "$CHARM_PATH"/src/prometheus_alert_rules -type f -exec ./promtool check rules {} \;
+          else
+            echo "This charm has no alert rules under /src/prometheus_alert_rules"
+          fi
+
+  linting-terraform:
+    name: Validate Terraform files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install dependencies
+        run: |
+          sudo snap install just --classic
+          sudo snap install terraform --classic
+          sudo snap install terraform-docs
+      - name: Install Terraform and validate modules
+        env:
+          CHARM_PATH: "${{ inputs.charm-path }}"
+        run: |
+          cd "$CHARM_PATH"
+          if [ -d terraform ]; then
+            just terraform-lint
+          else
+            echo "Terraform directory ($CHARM_PATH/terraform) does not exist. Skipping validation."
+          fi
+      - name: Lint docs
+        env:
+          CHARM_PATH: "${{ inputs.charm-path }}"
+        run: |
+          cd "$CHARM_PATH"
+          if [ -d terraform ]; then
+            just terraform-docs
+            git diff --exit-code terraform || {
+              echo "::error::Terraform docs are out of date. Run 'just terraform-docs' and commit."
+              exit 1
+            }
+          else
+            echo "Terraform directory ($CHARM_PATH/terraform) does not exist. Skipping docs validation."
+          fi
+
+  static-analysis:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Static analysis
+        run: |
+          sudo snap install astral-uv --classic
+          cd "${{ inputs.charm-path }}"
+          uvx tox -e static
+
+  unit-test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Unit tests
+        run: |
+          sudo snap install astral-uv --classic
+          cd "${{ inputs.charm-path }}"
+          uvx tox -e unit
+
+  pack-charm:
+    name: Pack the charm
+    runs-on: ubuntu-latest
+    needs:
+      - linting
+      - linting-rules
+      - static-analysis
+      - unit-test
+    outputs:
+      artifact-name: ${{ steps.artifact-name.outputs.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Compute artifact name
+        id: artifact-name
+        env:
+          CHARM_PATH: "${{ inputs.charm-path }}"
+        run: |
+          if [[ "$CHARM_PATH" != "." && -n "$CHARM_PATH" ]]; then
+            suffix="${CHARM_PATH//\//-}"
+            echo "name=charms-tests-${suffix}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=charms-tests" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Setup LXD
+        uses: canonical/setup-lxd@main
+      - name: Install charmcraft
+        run: sudo snap install charmcraft --classic --channel=${{ inputs.charmcraft-channel }}
+      - name: Cache wheels
+        uses: actions/cache@v5
+        with:
+          path: /home/runner/snap/charmcraft/common/cache/charmcraft
+          key: ${{ runner.os }}-wheel-cache-${{ hashFiles('./uv.lock') }}
+          # If the above cache key doesn't match, it's because the uv.lock has changed.
+          # Even so, pre-existing caches may still contain useful cached builds for some
+          # portion of the dependencies, and restore-keys can partially match a cache.
+          restore-keys: |
+            ${{ runner.os }}-wheel-cache-
+      - name: Run charmcraft pack
+        run: |
+          cd "${{ inputs.charm-path }}"
+          charmcraft pack -v
+      - name: Upload charm artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: ${{ inputs.charm-path }}/*.charm
+
+  integration-mono:
+    name: Integration Tests (sequential)
+    if: ${{ ! inputs.parallelize-integration && inputs.enable-integration }}
+    runs-on: ubuntu-latest
+    needs: [snap-channels, pack-charm]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install dependencies
+        env:
+          PROVIDER: "${{ inputs.provider }}"
+          CONCIERGE_JUJU_CHANNEL: "${{ needs.snap-channels.outputs.juju-channel }}"
+          CONCIERGE_CHARMCRAFT_CHANNEL: "${{ inputs.charmcraft-channel }}"
+          CONCIERGE_EXTRA_SNAPS: "astral-uv,terraform"
+        run: |
+          sudo snap install concierge --classic
+          case "$PROVIDER" in
+            machine)
+              sudo -E concierge prepare -p machine
+              juju model-defaults -c concierge-lxd automatically-retry-hooks=${{ inputs.automatically-retry-hooks }}
+              ;;
+            microk8s)
+              sudo -E concierge prepare -p microk8s
+              juju model-defaults -c concierge-microk8s automatically-retry-hooks=${{ inputs.automatically-retry-hooks }}
+              ;;
+            k8s)
+              sudo -E concierge prepare -p k8s
+              juju model-defaults -c concierge-k8s automatically-retry-hooks=${{ inputs.automatically-retry-hooks }}
+              # Configure Cilium for Istio ambient service mesh compatibility
+              sudo k8s kubectl patch configmap cilium-config -n kube-system --type merge -p '{"data":{"bpf-lb-sock-hostns-only":"true"}}'
+              sudo k8s kubectl rollout restart daemonset/cilium -n kube-system
+              sudo k8s kubectl rollout status daemonset/cilium -n kube-system --timeout=90s
+              ;;
+          esac
+      - name: Patch MetalLB RBAC (microk8s-core-addons RBAC/version-skew workaround)
+        # The microk8s metallb addon's bundled RBAC is generated from an older
+        # upstream MetalLB manifest than the image tag it deploys, so both the
+        # controller and speaker ClusterRoles are missing permissions on newer
+        # CRDs (configurationstates, servicebgpstatuses). Without this, the
+        # controller cannot assign IPs (missing configurationstates informer)
+        # and the speaker CrashLoopBackOffs via cache-sync timeout. Remove
+        # once fixed upstream:
+        # https://github.com/canonical/microk8s-core-addons/issues/405
+        if: ${{ inputs.provider == 'microk8s' }}
+        run: |
+          # Patch controller ClusterRole — needs configurationstates to start
+          # its informer cache and assign IPs to LoadBalancer Services
+          kubectl patch clusterrole metallb-system:controller --type=json -p='[
+            {"op":"add","path":"/rules/-","value":{"apiGroups":["metallb.io"],"resources":["configurationstates"],"verbs":["create","delete","get","list","patch","update","watch"]}},
+            {"op":"add","path":"/rules/-","value":{"apiGroups":["metallb.io"],"resources":["configurationstates/status"],"verbs":["get","patch","update"]}}
+          ]'
+          # Patch speaker ClusterRole — needs configurationstates and
+          # servicebgpstatuses to sync its cache on startup
+          kubectl patch clusterrole metallb-system:speaker --type=json -p='[
+            {"op":"add","path":"/rules/-","value":{"apiGroups":["metallb.io"],"resources":["configurationstates","configurationstates/status"],"verbs":["*"]}},
+            {"op":"add","path":"/rules/-","value":{"apiGroups":["metallb.io"],"resources":["servicebgpstatuses"],"verbs":["get","list","watch"]}}
+          ]'
+          # Restart both components so they pick up the new permissions
+          kubectl rollout restart deployment/controller -n metallb-system
+          kubectl rollout restart daemonset/speaker -n metallb-system
+          kubectl rollout status deployment/controller -n metallb-system --timeout=90s
+          kubectl rollout status daemonset/speaker -n metallb-system --timeout=90s
+      - name: Download charm artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.pack-charm.outputs.artifact-name }}
+          path: ${{ inputs.charm-path }}
+      - name: Run integration tests
+        run: |
+          cd ${{ inputs.charm-path }}
+          charm_relative_path="$(find . -maxdepth 1 -name '*.charm' | sort | tail -n1)"
+          CHARM_PATH="$(realpath "$charm_relative_path")"
+          export CHARM_PATH
+          uvx tox -e integration
+
+  integration-matrix:
+    name: Define Integration tests matrix
+    if: ${{ inputs.parallelize-integration && inputs.enable-integration }}
+    runs-on: ubuntu-latest
+    needs: [pack-charm]
+    outputs:
+      suites: ${{ steps.suites.outputs.suites }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Generate matrix list
+        id: suites
+        run: |
+          base_dir="$PWD"
+          cd ${{ inputs.charm-path }}
+          list="$(find tests/integration -name 'test_*.py' -printf '%f\n' | jq -r -ncR '[inputs]')"
+          if [[ "$list" == "[]" ]]; then
+            echo "No integration test files found in tests/integration. Searching in $base_dir/tests/integration."
+            list="$(find "$base_dir"/tests/integration -name 'test_*.py' -printf '%f\n' | jq -r -ncR '[inputs]')"
+          fi
+          echo "suites=$list"
+          echo "suites=$list" >> "$GITHUB_OUTPUT"
+
+  integration-test:
+    name: Integration Tests (parallel)
+    if: ${{ inputs.parallelize-integration && inputs.enable-integration }}
+    runs-on: ubuntu-latest
+    needs: [snap-channels, pack-charm, integration-matrix]
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.integration-matrix.outputs.suites) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install dependencies
+        env:
+          PROVIDER: "${{ inputs.provider }}"
+          CONCIERGE_JUJU_CHANNEL: "${{ needs.snap-channels.outputs.juju-channel }}"
+          CONCIERGE_CHARMCRAFT_CHANNEL: "${{ inputs.charmcraft-channel }}"
+          CONCIERGE_EXTRA_SNAPS: "astral-uv,terraform"
+        run: |
+          sudo snap install concierge --classic
+          case "$PROVIDER" in
+            machine)
+              sudo -E concierge prepare -p machine
+              juju model-defaults -c concierge-lxd automatically-retry-hooks=${{ inputs.automatically-retry-hooks }}
+              ;;
+            microk8s)
+              sudo -E concierge prepare -p microk8s
+              juju model-defaults -c concierge-microk8s automatically-retry-hooks=${{ inputs.automatically-retry-hooks }}
+              ;;
+            k8s)
+              sudo -E concierge prepare -p k8s
+              juju model-defaults -c concierge-k8s automatically-retry-hooks=${{ inputs.automatically-retry-hooks }}
+              # Configure Cilium for Istio ambient service mesh compatibility
+              sudo k8s kubectl patch configmap cilium-config -n kube-system --type merge -p '{"data":{"bpf-lb-sock-hostns-only":"true"}}'
+              sudo k8s kubectl rollout restart daemonset/cilium -n kube-system
+              sudo k8s kubectl rollout status daemonset/cilium -n kube-system --timeout=90s
+              ;;
+          esac
+      - name: Patch MetalLB RBAC (microk8s-core-addons RBAC/version-skew workaround)
+        # The microk8s metallb addon's bundled RBAC is generated from an older
+        # upstream MetalLB manifest than the image tag it deploys, so both the
+        # controller and speaker ClusterRoles are missing permissions on newer
+        # CRDs (configurationstates, servicebgpstatuses). Without this, the
+        # controller cannot assign IPs (missing configurationstates informer)
+        # and the speaker CrashLoopBackOffs via cache-sync timeout. Remove
+        # once fixed upstream:
+        # https://github.com/canonical/microk8s-core-addons/issues/405
+        if: ${{ inputs.provider == 'microk8s' }}
+        run: |
+          # Patch controller ClusterRole — needs configurationstates to start
+          # its informer cache and assign IPs to LoadBalancer Services
+          kubectl patch clusterrole metallb-system:controller --type=json -p='[
+            {"op":"add","path":"/rules/-","value":{"apiGroups":["metallb.io"],"resources":["configurationstates"],"verbs":["create","delete","get","list","patch","update","watch"]}},
+            {"op":"add","path":"/rules/-","value":{"apiGroups":["metallb.io"],"resources":["configurationstates/status"],"verbs":["get","patch","update"]}}
+          ]'
+          # Patch speaker ClusterRole — needs configurationstates and
+          # servicebgpstatuses to sync its cache on startup
+          kubectl patch clusterrole metallb-system:speaker --type=json -p='[
+            {"op":"add","path":"/rules/-","value":{"apiGroups":["metallb.io"],"resources":["configurationstates","configurationstates/status"],"verbs":["*"]}},
+            {"op":"add","path":"/rules/-","value":{"apiGroups":["metallb.io"],"resources":["servicebgpstatuses"],"verbs":["get","list","watch"]}}
+          ]'
+          # Restart both components so they pick up the new permissions
+          kubectl rollout restart deployment/controller -n metallb-system
+          kubectl rollout restart daemonset/speaker -n metallb-system
+          kubectl rollout status deployment/controller -n metallb-system --timeout=90s
+          kubectl rollout status daemonset/speaker -n metallb-system --timeout=90s
+      # FIXME: Remove the below step when runners are configurable. See https://github.com/canonical/observability/issues/408.
+      - name: Clean worker caches
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Remove Swift toolchain
+          sudo rm -rf /usr/share/swift
+          # Remove Java (JDKs)
+          sudo rm -rf /usr/lib/jvm
+          # Remove Chromium (optional if not using for browser tests)
+          sudo rm -rf /usr/local/share/chromium
+          # Remove Microsoft/Edge and Google Chrome builds
+          sudo rm -rf /opt/microsoft /opt/google
+          # Remove Azure CLI
+          sudo rm -rf /opt/az
+          # Remove Haskell (GHC)
+          sudo rm -rf /usr/local/.ghcup
+          # Docker clean up
+          sudo docker image prune --all --force
+          sudo docker builder prune -a
+      - name: Download charm artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.pack-charm.outputs.artifact-name }}
+          path: ${{ inputs.charm-path }}
+      - name: Run integration tests
+        run: |
+          cd ${{ inputs.charm-path }}
+          charm_relative_path="$(find . -maxdepth 1 -name '*.charm' | sort | tail -n1)"
+          CHARM_PATH="$(realpath "$charm_relative_path")"
+          export CHARM_PATH
+          if [[ "${{ runner.debug }}" == "1" ]]; then
+            export KEEP_MODELS=true
+            sudo snap install jhack --channel=latest/edge && sudo snap connect jhack:dot-local-share-juju snapd
+            uvx tox -e integration -- -k "${{ matrix.suite }}" --keep-models
+          else
+            uvx tox -e integration -- -k "${{ matrix.suite }}"
+          fi
+      - name: Open SSH session on failure
+        if: ${{ failure() && (runner.debug == '1') }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          timeout-minutes: 30
+          limit-access-to-actor: true
