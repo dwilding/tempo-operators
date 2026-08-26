@@ -13,6 +13,7 @@ from tests.integration.helpers import (
     emit_trace,
     get_app_ip_address,
     get_tempo_application_endpoint,
+    get_unit_ip_address,
     query_traces_patiently_from_client_localhost,
 )
 
@@ -46,9 +47,11 @@ def get_metrics(ip: str, port: int):
 
 
 def test_metrics_endpoints(juju):
-    # verify that all worker apps and the coordinator can be scraped for metrics on their application IP
+    # verify that all worker apps and the coordinator can be scraped for metrics
+    # Use unit IP (pod IP) rather than app address (ClusterIP), as the
+    # ClusterIP is not reachable from outside the Kubernetes cluster.
     for app in (*ALL_WORKERS, TEMPO_APP):
-        app_ip = get_app_ip_address(juju, app)
+        app_ip = get_unit_ip_address(juju, app, 0)
         assert get_metrics(app_ip, port=Tempo.tempo_http_server_port)
 
 
