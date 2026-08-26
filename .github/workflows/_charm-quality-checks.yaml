@@ -298,12 +298,24 @@ jobs:
         with:
           name: ${{ needs.pack-charm.outputs.artifact-name }}
           path: ${{ inputs.charm-path }}
+      - name: Download worker charm artifact
+        # The coordinator integration tests deploy both coordinator and worker
+        # charms, so we need the worker charm artifact too.
+        if: ${{ inputs.charm-path == 'coordinator' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: charms-tests-worker
+          path: coordinator
       - name: Run integration tests
         run: |
           cd ${{ inputs.charm-path }}
           charm_relative_path="$(find . -maxdepth 1 -name '*.charm' | sort | tail -n1)"
           CHARM_PATH="$(realpath "$charm_relative_path")"
           export CHARM_PATH
+          # Also set WORKER_CHARM_PATH if the worker charm is available
+          if [[ -f "tempo-worker-k8s_ubuntu@26.04-amd64.charm" ]]; then
+            export WORKER_CHARM_PATH="$(realpath tempo-worker-k8s_ubuntu@26.04-amd64.charm)"
+          fi
           uvx tox -e integration
 
   integration-matrix:
@@ -419,12 +431,24 @@ jobs:
         with:
           name: ${{ needs.pack-charm.outputs.artifact-name }}
           path: ${{ inputs.charm-path }}
+      - name: Download worker charm artifact
+        # The coordinator integration tests deploy both coordinator and worker
+        # charms, so we need the worker charm artifact too.
+        if: ${{ inputs.charm-path == 'coordinator' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: charms-tests-worker
+          path: coordinator
       - name: Run integration tests
         run: |
           cd ${{ inputs.charm-path }}
           charm_relative_path="$(find . -maxdepth 1 -name '*.charm' | sort | tail -n1)"
           CHARM_PATH="$(realpath "$charm_relative_path")"
           export CHARM_PATH
+          # Also set WORKER_CHARM_PATH if the worker charm is available
+          if [[ -f "tempo-worker-k8s_ubuntu@26.04-amd64.charm" ]]; then
+            export WORKER_CHARM_PATH="$(realpath tempo-worker-k8s_ubuntu@26.04-amd64.charm)"
+          fi
           if [[ "${{ runner.debug }}" == "1" ]]; then
             export KEEP_MODELS=true
             sudo snap install jhack --channel=latest/edge && sudo snap connect jhack:dot-local-share-juju snapd
