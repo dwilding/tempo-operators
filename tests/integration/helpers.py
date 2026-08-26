@@ -640,7 +640,9 @@ def service_mesh(
 
 def scrape_metrics(juju: Juju, app: str) -> str:
     """Scrape the Prometheus /metrics endpoint of *app* and return the raw text."""
-    app_ip = get_app_ip_address(juju, app)
+    # Use the unit IP rather than the app address (ClusterIP), as the
+    # ClusterIP is not reachable from outside the Kubernetes cluster.
+    app_ip = get_unit_ip_address(juju, app, 0)
     resp = requests.get(f"http://{app_ip}:3200/metrics", timeout=15)
     resp.raise_for_status()
     return resp.text
